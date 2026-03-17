@@ -1,178 +1,149 @@
-using UnityEngine;
-using Unity.Barracuda;
 using System.Collections.Generic;
+using Unity.Barracuda;
+using UnityEngine;
 
-// Note: Ensure your Detection.cs file defines Detection as a 'struct' to reduce memory pressure
+// Moved outside the class to be accessible globally by your other scripts
+[System.Serializable]
+public struct Detection
+{
+    public int classIndex;
+    public string className;
+    public float confidence;
+    public Rect bbox;
+}
+
 public class YOLOv8Detector : MonoBehaviour
 {
-    [Header("Model Settings")]
+    [Header("Model Files")]
     public NNModel modelAsset;
+    private IWorker worker;
 
-    [Header("Detection Settings")]
-    [Range(0f, 1f)] public float confidenceThreshold = 0.25f;
-    [Range(0f, 1f)] public float iouThreshold = 0.45f;
+    [Header("Settings")]
+    [Range(0, 1)] public float confidenceThreshold = 0.5f;
+    [Range(0, 1)] public float iouThreshold = 0.45f;
 
-    [Header("Input Settings")]
-    public int inputWidth = 640;
-    public int inputHeight = 640;
+    // Custom classes: Ensure these match your model's training order
+    private string[] classNames = { "Rock", "Root" };
 
-    private Model runtimeModel;
-    private IWorker engine;
-    private bool isInitialized = false;
-
-    // Updated for your specific model classes
-    private string[] classNames = new string[] { "Rock", "Root" };
-
-    void Start()
+    void Awake()
     {
-        Invoke(nameof(InitializeModel), 2f);
-    }
-
-    void InitializeModel()
-    {
-        if (modelAsset == null)
+        if (modelAsset != null)
         {
-            Debug.LogError("No model asset assigned!");
-            return;
-        }
-
-        try
-        {
-            runtimeModel = ModelLoader.Load(modelAsset);
-            engine = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, runtimeModel);
-            isInitialized = true;
-            Debug.Log("YOLOv8 custom model (Rock/Root) initialized successfully!");
-        }
-        catch (System.Exception e)
-        {
-            Debug.LogError($"Failed to initialize model: {e.Message}");
+            var model = ModelLoader.Load(modelAsset);
+            worker = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, model);
         }
     }
 
-    public List<Detection> Detect(Texture2D inputImage)
+    // Now a method to match your Manager script's "IsReady()" call
+    public bool IsReady()
     {
-        if (!isInitialized) return new List<Detection>();
-
-        Tensor inputTensor = Preprocess(inputImage);
-        engine.Execute(inputTensor);
-        Tensor output = engine.PeekOutput();
-        List<Detection> detections = PostProcess(output, inputImage.width, inputImage.height);
-        inputTensor.Dispose();
-
-        return detections;
+        return worker != null;
     }
 
-    Tensor Preprocess(Texture2D source)
+    public List<Detection> Detect(Texture2D inputTexture)
     {
-        RenderTexture rt = RenderTexture.GetTemporary(inputWidth, inputHeight, 0, RenderTextureFormat.ARGB32);
-        Graphics.Blit(source, rt);
-        Tensor tensor = new Tensor(rt, 3);
-        RenderTexture.ReleaseTemporary(rt);
-        return tensor;
+        using (var inputTensor = new Tensor(inputTexture, 3))
+        {
+            worker.Execute(inputTensor);
+            var output = worker.PeekOutput();
+
+            List<Detection> results = PostProcess(output, inputTexture.width, inputTexture.height);
+
+            output.Dispose();
+            return results;
+        }
     }
 
-    List<Detection> PostProcess(Tensor output, int originalWidth, int originalHeight)
+    private List<Detection> PostProcess(Tensor output, int width, int height)
     {
         List<Detection> allDetections = new List<Detection>();
-        float[] outputData = output.ToReadOnlyArray();
+        float[] data = output.ToReadOnlyArray();
 
-        int numPredictions = 8400;
-        int numClasses = classNames.Length; // Adjusted to 2 classes
+        int numStructs = output.width; // 8400
+        int numClasses = classNames.Length; // 2
 
-        for (int i = 0; i < numPredictions; i++)
+        for (int i = 0; i < numStructs; i++)
         {
-            float maxConfidence = 0f;
-            int maxClassIndex = 0;
+            float maxScore = 0f;
+            int classId = -1;
 
             for (int c = 0; c < numClasses; c++)
             {
-                // Indexing logic for YOLOv8: 4 box coords + N classes
-                int index = (4 + c) * numPredictions + i;
-                float confidence = outputData[index];
-
-                if (confidence > maxConfidence)
+                // Indexing math for YOLOv8 (4 coords + class scores)
+                float score = data[(4 + c) * numStructs + i];
+                if (score > maxScore)
                 {
-                    maxConfidence = confidence;
-                    maxClassIndex = c;
+                    maxScore = score;
+                    classId = c;
                 }
             }
 
-            if (maxConfidence < confidenceThreshold) continue;
-
-            float cx = outputData[0 * numPredictions + i];
-            float cy = outputData[1 * numPredictions + i];
-            float w = outputData[2 * numPredictions + i];
-            float h = outputData[3 * numPredictions + i];
-
-            float x1 = (cx - w / 2f) * originalWidth;
-            float y1 = (cy - h / 2f) * originalHeight;
-            float boxWidth = w * originalWidth;
-            float boxHeight = h * originalHeight;
-
-            allDetections.Add(new Detection
+            if (maxScore > confidenceThreshold)
             {
-                classIndex = maxClassIndex,
-                className = classNames[maxClassIndex],
-                confidence = maxConfidence,
-                bbox = new Rect(x1, y1, boxWidth, boxHeight)
-            });
+                float cx = data[0 * numStructs + i];
+                float cy = data[1 * numStructs + i];
+                float w = data[2 * numStructs + i];
+                float h = data[3 * numStructs + i];
+
+                float x = (cx - w / 2f) * width;
+                float y = (cy - h / 2f) * height;
+                float rectW = w * width;
+                float rectH = h * height;
+
+                allDetections.Add(new Detection
+                {
+                    classIndex = classId,
+                    className = classNames[classId],
+                    confidence = maxScore,
+                    bbox = new Rect(x, y, rectW, rectH)
+                });
+            }
         }
 
-        return ApplyNMS(allDetections, iouThreshold);
+        return ApplyNMS(allDetections);
     }
 
-    List<Detection> ApplyNMS(List<Detection> detections, float iouThreshold)
+    private List<Detection> ApplyNMS(List<Detection> detections)
     {
         detections.Sort((a, b) => b.confidence.CompareTo(a.confidence));
-        List<Detection> result = new List<Detection>();
-        bool[] suppressed = new bool[detections.Count];
+        List<Detection> filtered = new List<Detection>();
 
-        for (int i = 0; i < detections.Count; i++)
+        while (detections.Count > 0)
         {
-            if (suppressed[i]) continue;
-            result.Add(detections[i]);
+            Detection top = detections[0];
+            filtered.Add(top);
+            detections.RemoveAt(0);
 
-            for (int j = i + 1; j < detections.Count; j++)
+            for (int i = detections.Count - 1; i >= 0; i--)
             {
-                if (suppressed[j]) continue;
-                if (CalculateIOU(detections[i].bbox, detections[j].bbox) > iouThreshold)
+                if (CalculateIOU(top.bbox, detections[i].bbox) > iouThreshold)
                 {
-                    suppressed[j] = true;
+                    detections.RemoveAt(i);
                 }
             }
         }
-
-        return result;
+        return filtered;
     }
 
-    float CalculateIOU(Rect box1, Rect box2)
+    private float CalculateIOU(Rect boxA, Rect boxB)
     {
-        float x1 = Mathf.Max(box1.xMin, box2.xMin);
-        float y1 = Mathf.Max(box1.yMin, box2.yMin);
-        float x2 = Mathf.Min(box1.xMax, box2.xMax);
-        float y2 = Mathf.Min(box1.yMax, box2.yMax);
+        float areaA = boxA.width * boxA.height;
+        float areaB = boxB.width * boxB.height;
 
-        float intersectionArea = Mathf.Max(0, x2 - x1) * Mathf.Max(0, y2 - y1);
-        float unionArea = box1.width * box1.height + box2.width * box2.height - intersectionArea;
+        float x1 = Mathf.Max(boxA.xMin, boxB.xMin);
+        float y1 = Mathf.Max(boxA.yMin, boxB.yMin);
+        float x2 = Mathf.Min(boxA.xMax, boxB.xMax);
+        float y2 = Mathf.Min(boxA.yMax, boxB.yMax);
 
-        return unionArea == 0 ? 0 : intersectionArea / unionArea;
+        float interW = Mathf.Max(0, x2 - x1);
+        float interH = Mathf.Max(0, y2 - y1);
+        float interArea = interW * interH;
+
+        return interArea / (areaA + areaB - interArea);
     }
 
-    public bool IsReady()
+    private void OnDestroy()
     {
-        return isInitialized;
-    }
-
-    void OnDestroy()
-    {
-        // Fix for "Low Memory on Close": Explicitly release resources
-        if (engine != null)
-        {
-            engine.Dispose();
-            engine = null;
-        }
-
-        Resources.UnloadUnusedAssets();
-        System.GC.Collect();
+        worker?.Dispose();
     }
 }
