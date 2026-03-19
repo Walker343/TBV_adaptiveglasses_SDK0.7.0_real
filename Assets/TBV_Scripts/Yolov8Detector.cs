@@ -1,149 +1,151 @@
-using System.Collections.Generic;
-using Unity.Barracuda;
 using UnityEngine;
+using Unity.Barracuda;
+using System.Collections.Generic;
+using System.Linq;
 
-// Moved outside the class to be accessible globally by your other scripts
-[System.Serializable]
-public struct Detection
+public class Yolov8Detector : MonoBehaviour
 {
-    public int classIndex;
-    public string className;
-    public float confidence;
-    public Rect bbox;
-}
-
-public class YOLOv8Detector : MonoBehaviour
-{
-    [Header("Model Files")]
+    [Header("Resources")]
     public NNModel modelAsset;
-    private IWorker worker;
 
     [Header("Settings")]
+    public int modelInputSize = 640;
     [Range(0, 1)] public float confidenceThreshold = 0.5f;
-    [Range(0, 1)] public float iouThreshold = 0.45f;
+    [Range(0, 1)] public float nmsThreshold = 0.45f;
 
-    // Custom classes: Ensure these match your model's training order
-    private string[] classNames = { "Rock", "Root" };
+    [Header("Debug")]
+    public bool showDebugLogs = true;
 
-    void Awake()
+    private IWorker worker;
+    private RenderTexture resizedRT;
+
+    private const int numBoxes = 8400;
+    private const int numChannels = 6;
+
+    void Start()
     {
-        if (modelAsset != null)
+        if (modelAsset == null)
         {
-            var model = ModelLoader.Load(modelAsset);
-            worker = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, model);
+            Debug.LogError("[YOLO] ERROR: Neural Network Model Asset is MISSING in the Inspector!");
+            return;
         }
+
+        Debug.Log("[YOLO] Loading model...");
+        Model runtimeModel = ModelLoader.Load(modelAsset);
+        worker = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, runtimeModel);
+        Debug.Log("[YOLO] Worker initialized successfully! Ready for inference.");
     }
 
-    // Now a method to match your Manager script's "IsReady()" call
-    public bool IsReady()
-    {
-        return worker != null;
-    }
+    private float Sigmoid(float x) => 1.0f / (1.0f + Mathf.Exp(-x));
 
-    public List<Detection> Detect(Texture2D inputTexture)
+    public List<Detection> Detect(Texture2D frame)
     {
-        using (var inputTensor = new Tensor(inputTexture, 3))
+        List<Detection> results = new List<Detection>();
+        if (worker == null || frame == null) return results;
+
+        if (resizedRT == null)
+        {
+            resizedRT = new RenderTexture(modelInputSize, modelInputSize, 0, RenderTextureFormat.ARGB32);
+            resizedRT.Create();
+        }
+
+        Graphics.Blit(frame, resizedRT);
+
+        using (var inputTensor = new Tensor(resizedRT, 3))
         {
             worker.Execute(inputTensor);
-            var output = worker.PeekOutput();
+            var output = worker.CopyOutput();
+            List<Detection> candidates = new List<Detection>();
 
-            List<Detection> results = PostProcess(output, inputTexture.width, inputTexture.height);
+            // Labels must match your training order
+            string[] labels = { "Rock", "Root" };
 
-            output.Dispose();
-            return results;
-        }
-    }
-
-    private List<Detection> PostProcess(Tensor output, int width, int height)
-    {
-        List<Detection> allDetections = new List<Detection>();
-        float[] data = output.ToReadOnlyArray();
-
-        int numStructs = output.width; // 8400
-        int numClasses = classNames.Length; // 2
-
-        for (int i = 0; i < numStructs; i++)
-        {
-            float maxScore = 0f;
-            int classId = -1;
-
-            for (int c = 0; c < numClasses; c++)
+            for (int i = 0; i < numBoxes; i++)
             {
-                // Indexing math for YOLOv8 (4 coords + class scores)
-                float score = data[(4 + c) * numStructs + i];
-                if (score > maxScore)
+                // Fix: Barracuda Tensors require 4 indices [batch, height, width, channel]
+                // For YOLOv8 outputs [1, 6, 8400], it maps to [0, 0, channelIndex, boxIndex]
+                float x_center = output[0, 0, 0, i];
+                float y_center = output[0, 0, 1, i];
+                float w = output[0, 0, 2, i];
+                float h = output[0, 0, 3, i];
+
+                // Find the best class score starting from index 4
+                float maxClassScore = -Mathf.Infinity;
+                int classId = 0;
+
+                for (int c = 0; c < (numChannels - 4); c++)
                 {
-                    maxScore = score;
-                    classId = c;
+                    float score = output[0, 0, 4 + c, i];
+                    if (score > maxClassScore)
+                    {
+                        maxClassScore = score;
+                        classId = c;
+                    }
+                }
+
+                // Convert raw logit to a 0.0-1.0 probability
+                float confidence = Sigmoid(maxClassScore);
+
+                if (confidence > confidenceThreshold)
+                {
+                    // Map center-coordinates to Top-Left Rect format
+                    float x = x_center - (w / 2f);
+                    float y = y_center - (h / 2f);
+
+                    candidates.Add(new Detection
+                    {
+                        classIndex = classId,
+                        className = labels[classId],
+                        confidence = confidence,
+                        bbox = new Rect(x, y, w, h)
+                    });
                 }
             }
 
-            if (maxScore > confidenceThreshold)
-            {
-                float cx = data[0 * numStructs + i];
-                float cy = data[1 * numStructs + i];
-                float w = data[2 * numStructs + i];
-                float h = data[3 * numStructs + i];
-
-                float x = (cx - w / 2f) * width;
-                float y = (cy - h / 2f) * height;
-                float rectW = w * width;
-                float rectH = h * height;
-
-                allDetections.Add(new Detection
-                {
-                    classIndex = classId,
-                    className = classNames[classId],
-                    confidence = maxScore,
-                    bbox = new Rect(x, y, rectW, rectH)
-                });
-            }
+            // 4. Remove overlapping boxes
+            results = ApplyNMS(candidates, nmsThreshold);
         }
 
-        return ApplyNMS(allDetections);
+        return results;
     }
 
-    private List<Detection> ApplyNMS(List<Detection> detections)
-    {
-        detections.Sort((a, b) => b.confidence.CompareTo(a.confidence));
-        List<Detection> filtered = new List<Detection>();
+    public bool IsReady() => worker != null;
 
-        while (detections.Count > 0)
+    private List<Detection> ApplyNMS(List<Detection> boxes, float threshold)
+    {
+        var sorted = boxes.OrderByDescending(b => b.confidence).ToList();
+        List<Detection> selected = new List<Detection>();
+        while (sorted.Count > 0)
         {
-            Detection top = detections[0];
-            filtered.Add(top);
-            detections.RemoveAt(0);
-
-            for (int i = detections.Count - 1; i >= 0; i--)
+            var current = sorted[0];
+            selected.Add(current);
+            sorted.RemoveAt(0);
+            for (int i = sorted.Count - 1; i >= 0; i--)
             {
-                if (CalculateIOU(top.bbox, detections[i].bbox) > iouThreshold)
-                {
-                    detections.RemoveAt(i);
-                }
+                if (IntersectionOverUnion(current.bbox, sorted[i].bbox) > threshold) sorted.RemoveAt(i);
             }
         }
-        return filtered;
+        return selected;
     }
 
-    private float CalculateIOU(Rect boxA, Rect boxB)
+    private float IntersectionOverUnion(Rect a, Rect b)
     {
-        float areaA = boxA.width * boxA.height;
-        float areaB = boxB.width * boxB.height;
-
-        float x1 = Mathf.Max(boxA.xMin, boxB.xMin);
-        float y1 = Mathf.Max(boxA.yMin, boxB.yMin);
-        float x2 = Mathf.Min(boxA.xMax, boxB.xMax);
-        float y2 = Mathf.Min(boxA.yMax, boxB.yMax);
-
-        float interW = Mathf.Max(0, x2 - x1);
-        float interH = Mathf.Max(0, y2 - y1);
-        float interArea = interW * interH;
-
-        return interArea / (areaA + areaB - interArea);
+        float areaA = a.width * a.height;
+        float areaB = b.width * b.height;
+        Rect intersect = Rect.MinMaxRect(
+            Mathf.Max(a.xMin, b.xMin),
+            Mathf.Max(a.yMin, b.yMin),
+            Mathf.Min(a.xMax, b.xMax),
+            Mathf.Min(a.yMax, b.yMax)
+        );
+        if (intersect.width <= 0 || intersect.height <= 0) return 0;
+        float intersectArea = intersect.width * intersect.height;
+        return intersectArea / (areaA + areaB - intersectArea);
     }
 
-    private void OnDestroy()
+    private void OnDisable()
     {
         worker?.Dispose();
+        if (resizedRT != null) resizedRT.Release();
     }
 }

@@ -1113,7 +1113,7 @@ MonoBehaviour:
   vitureCamera: {fileID: 1696674497}
   yoloDetector: {fileID: 1696674501}
   statsText: {fileID: 1375947699}
-  detectionInterval: 3
+  detectionInterval: 0.5
   showDebugLogs: 1
 --- !u!4 &1696674500
 Transform:
@@ -1144,9 +1144,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::YOLOv8Detector
   modelAsset: {fileID: 5022602860645237092, guid: e06bda43c9628cc428600531254a219c, type: 3}
   modelInputSize: 640
-  confidenceThreshold: 0.65
-  nmsThreshold: 0.5
-  showDebugLogs: 1
+  confidenceThreshold: 0.8
+  nmsThreshold: 0.45
 --- !u!1660057539 &9223372036854775807
 SceneRoots:
   m_ObjectHideFlags: 0
