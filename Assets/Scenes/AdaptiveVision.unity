@@ -1144,8 +1144,8 @@ MonoBehaviour:
   m_EditorClassIdentifier: Assembly-CSharp::YOLOv8Detector
   modelAsset: {fileID: 5022602860645237092, guid: e06bda43c9628cc428600531254a219c, type: 3}
   modelInputSize: 640
-  confidenceThreshold: 0.65
-  nmsThreshold: 0.5
+  confidenceThreshold: 0.3
+  nmsThreshold: 0.3
   showDebugLogs: 1
 --- !u!1660057539 &9223372036854775807
 SceneRoots:

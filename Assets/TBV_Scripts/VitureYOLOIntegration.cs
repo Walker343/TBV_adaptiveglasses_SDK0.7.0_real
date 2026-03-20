@@ -26,34 +26,51 @@ public class VitureYOLOIntegration : MonoBehaviour
     private int frameCount;
     private float currentFPS;
 
-    void Start()
-    {
-        Debug.Log("=== VitureYOLOIntegration START ===");
-
-        if (vitureCamera == null)
-            Debug.LogError("VitureRGBCamera component not assigned!");
-        else
-            Debug.Log("VitureRGBCamera assigned OK");
-
-        if (yoloDetector == null)
-            Debug.LogError("YOLOv8Detector component not assigned!");
-        else
-            Debug.Log("YOLOv8Detector assigned OK");
-    }
-
     void Update()
     {
         UpdateFPS();
 
-        if (yoloDetector == null || !yoloDetector.IsReady()) return;
+        // CHECK 1: Wait for Camera initialization (prevents the 2-second startup crash)
+        if (vitureCamera == null || !vitureCamera.IsReady()) return;
 
-        var manager = Viture.XR.VitureRGBCameraManager.Instance;
-        if (manager == null || manager.CameraRenderTexture == null) return;
+        // CHECK 2: Ensure AI is ready
+        if (yoloDetector == null || !yoloDetector.IsReady()) return;
 
         if (!isDetecting && Time.time - lastDetectionTime >= detectionInterval)
         {
-            lastDetectionTime = Time.time;
             RunDetection();
+            lastDetectionTime = Time.time;
+        }
+    }
+
+    async void RunDetection()
+    {
+        isDetecting = true;
+
+        // Use the new Low-Res capture to guarantee 640x640 input
+        Texture2D frame = await vitureCamera.CaptureLowResFrameAsync();
+
+        if (frame == null)
+        {
+            isDetecting = false;
+            return;
+        }
+
+        if (showDebugLogs && currentFPS > 0)
+            Debug.Log($"[YOLO] Scanning 640x640 frame... ({currentFPS:F1} FPS)");
+
+        // Run the AI on the perfectly-sized frame
+        currentDetections = yoloDetector.Detect(frame);
+
+        // Clean up the temporary frame immediately to prevent memory leaks
+        Destroy(frame);
+
+        UpdateStatsDisplay();
+        isDetecting = false;
+
+        if (showDebugLogs && currentDetections.Count > 0)
+        {
+            Debug.Log($"[YOLO] SUCCESS! Detected {currentDetections.Count} objects.");
         }
     }
 
@@ -61,7 +78,6 @@ public class VitureYOLOIntegration : MonoBehaviour
     {
         frameCount++;
         fpsTimer += Time.deltaTime;
-
         if (fpsTimer >= 1.0f)
         {
             currentFPS = frameCount / fpsTimer;
@@ -75,48 +91,5 @@ public class VitureYOLOIntegration : MonoBehaviour
     {
         if (statsText != null)
             statsText.text = $"FPS: {currentFPS:F1}\nDetections: {currentDetections.Count}";
-    }
-
-    async void RunDetection()
-    {
-        isDetecting = true;
-
-        Texture2D frame = await Viture.XR.VitureRGBCameraManager.Instance.CaptureFrameAsync();
-
-        if (frame == null)
-        {
-            Debug.LogWarning("[YOLO] CaptureFrameAsync returned null!");
-            isDetecting = false;
-            return;
-        }
-
-        if (showDebugLogs)
-            Debug.Log($"[YOLO] Scanning frame... (Running at {currentFPS:F1} FPS)");
-
-        currentDetections = yoloDetector.Detect(frame);
-        Destroy(frame);
-
-        UpdateStatsDisplay();
-
-        if (showDebugLogs)
-        {
-            if (currentDetections.Count > 0)
-            {
-                Debug.Log($"[YOLO] SUCCESS! Detected {currentDetections.Count} objects:");
-                foreach (var det in currentDetections)
-                    Debug.Log($"  - {det.className} at ({det.bbox.x:F2}, {det.bbox.y:F2}) confidence: {det.confidence:F2}");
-            }
-            else
-            {
-                Debug.Log("[YOLO] Scan complete. 0 objects found.");
-            }
-        }
-
-        isDetecting = false;
-    }
-
-    public List<Detection> GetCurrentDetections()
-    {
-        return new List<Detection>(currentDetections);
     }
 }

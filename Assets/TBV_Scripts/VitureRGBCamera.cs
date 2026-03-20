@@ -1,5 +1,7 @@
 using UnityEngine;
 using Viture.XR;
+using UnityEngine.Rendering;
+using System.Threading.Tasks;
 #if UNITY_ANDROID
 using UnityEngine.Android;
 #endif
@@ -14,17 +16,14 @@ public class VitureRGBCamera : MonoBehaviour
     public bool showDebugLogs = true;
 
     private RenderTexture cameraRenderTexture;
-    private RenderTexture lowResRT; // The 640x640 GPU buffer
-    private Texture2D currentFrame;
+    private RenderTexture lowResRT;
     private bool isReady = false;
-    private float nextDebugLogTime = 0f;
 
     void Start()
     {
 #if UNITY_ANDROID
         if (!Permission.HasUserAuthorizedPermission(Permission.Camera))
         {
-            Debug.Log("[VitureCamera] Requesting Camera Permission...");
             Permission.RequestUserPermission(Permission.Camera);
         }
 #endif
@@ -44,52 +43,46 @@ public class VitureRGBCamera : MonoBehaviour
         {
             cameraRenderTexture = manager.CameraRenderTexture;
 
-            // 1. Initialize the Texture2D at the SMALLER size
-            currentFrame = new Texture2D(desiredWidth, desiredHeight, TextureFormat.RGB24, false);
-
-            // 2. Create the low-res GPU buffer
+            // Create the low-res GPU buffer (640x640)
             lowResRT = new RenderTexture(desiredWidth, desiredHeight, 0);
             lowResRT.Create();
 
             isReady = true;
-            Debug.Log($"[VitureCamera] Initialized. Output size: {desiredWidth}x{desiredHeight}");
+            if (showDebugLogs) Debug.Log($"[VitureCamera] AI Buffer Initialized: {desiredWidth}x{desiredHeight}");
         }
     }
 
-    void Update()
+    /// <summary>
+    /// Forces a low-resolution capture (640x640) asynchronously.
+    /// This prevents the 1080p shape-mismatch crash.
+    /// </summary>
+    public async Task<Texture2D> CaptureLowResFrameAsync()
     {
-        if (isReady && cameraRenderTexture != null)
+        if (!isReady || cameraRenderTexture == null) return null;
+
+        // 1. Resize from 1080p to 640x640 on the GPU
+        Graphics.Blit(cameraRenderTexture, lowResRT);
+
+        // 2. Request the data from the GPU asynchronously
+        var request = AsyncGPUReadback.Request(lowResRT);
+
+        while (!request.done)
         {
-            // 3. Blit (Copy + Resize) from 1080p to 640x640 on the GPU
-            Graphics.Blit(cameraRenderTexture, lowResRT);
-
-            // 4. Read ONLY the 640x640 pixels into the Texture2D
-            RenderTexture.active = lowResRT;
-            currentFrame.ReadPixels(new Rect(0, 0, desiredWidth, desiredHeight), 0, 0);
-            currentFrame.Apply();
-            RenderTexture.active = null;
+            await Task.Yield();
         }
-    }
 
-    public Texture2D GetCurrentFrame() => currentFrame;
+        if (request.hasError) return null;
+
+        // 3. Create a small texture and fill it with the 640x640 data
+        Texture2D tex = new Texture2D(desiredWidth, desiredHeight, TextureFormat.RGBA32, false);
+        tex.SetPixelData(request.GetData<Color32>(), 0);
+        tex.Apply();
+
+        return tex;
+    }
 
     public bool IsReady()
     {
-        bool isActive = VitureXR.Camera.RGB.isActive;
-        bool readyStatus = isReady && isActive && currentFrame != null;
-
-        if (!readyStatus && showDebugLogs && Time.time > nextDebugLogTime && isReady)
-        {
-            Debug.LogWarning($"[Camera Waiting] isActive:{isActive}");
-            nextDebugLogTime = Time.time + 2f;
-        }
-
-        return readyStatus;
-    }
-
-    void OnDestroy()
-    {
-        if (lowResRT != null) lowResRT.Release();
-        if (currentFrame != null) Destroy(currentFrame);
+        return isReady && VitureXR.Camera.RGB.isActive && cameraRenderTexture != null;
     }
 }

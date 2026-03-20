@@ -19,6 +19,7 @@ public class Yolov8Detector : MonoBehaviour
     private IWorker worker;
     private RenderTexture resizedRT;
 
+    // Standard YOLOv8-base constants
     private const int numBoxes = 8400;
     private const int numChannels = 6;
 
@@ -26,103 +27,97 @@ public class Yolov8Detector : MonoBehaviour
     {
         if (modelAsset == null)
         {
-            Debug.LogError("[YOLO] ERROR: Neural Network Model Asset is MISSING in the Inspector!");
+            Debug.LogError("[YOLO] ERROR: Model Asset is MISSING!");
             return;
         }
 
-        Debug.Log("[YOLO] Loading model...");
+        // 1. Load the model
         Model runtimeModel = ModelLoader.Load(modelAsset);
-        worker = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, runtimeModel);
-        Debug.Log("[YOLO] Worker initialized successfully! Ready for inference.");
-    }
 
-    private float Sigmoid(float x) => 1.0f / (1.0f + Mathf.Exp(-x));
+        // 2. Create the worker (GPU-accelerated)
+        worker = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, runtimeModel);
+
+        // 3. Initialize the inference buffer immediately.
+        // Doing this here prevents the "Off-axis" crash caused by uninitialized textures.
+        resizedRT = new RenderTexture(modelInputSize, modelInputSize, 0, RenderTextureFormat.ARGB32);
+        resizedRT.Create();
+
+        if (showDebugLogs)
+            Debug.Log($"[YOLO] Worker initialized. Buffer set to {modelInputSize}x{modelInputSize}.");
+    }
 
     public List<Detection> Detect(Texture2D frame)
     {
-        List<Detection> results = new List<Detection>();
-        if (worker == null || frame == null) return results;
+        if (worker == null || frame == null) return new List<Detection>();
 
-        if (resizedRT == null)
-        {
-            resizedRT = new RenderTexture(modelInputSize, modelInputSize, 0, RenderTextureFormat.ARGB32);
-            resizedRT.Create();
-        }
-
+        // 4. Use the GPU to force the input frame into the perfect 640x640 shape
         Graphics.Blit(frame, resizedRT);
 
+        // 5. Convert to Tensor for Barracuda
         using (var inputTensor = new Tensor(resizedRT, 3))
         {
             worker.Execute(inputTensor);
-            var output = worker.CopyOutput();
-            List<Detection> candidates = new List<Detection>();
 
-            // Labels must match your training order
-            string[] labels = { "Rock", "Root" };
+            // Get output and process
+            var output = worker.PeekOutput();
+            var results = ParseOutput(output);
 
-            for (int i = 0; i < numBoxes; i++)
-            {
-                // Fix: Barracuda Tensors require 4 indices [batch, height, width, channel]
-                // For YOLOv8 outputs [1, 6, 8400], it maps to [0, 0, channelIndex, boxIndex]
-                float x_center = output[0, 0, 0, i];
-                float y_center = output[0, 0, 1, i];
-                float w = output[0, 0, 2, i];
-                float h = output[0, 0, 3, i];
-
-                // Find the best class score starting from index 4
-                float maxClassScore = -Mathf.Infinity;
-                int classId = 0;
-
-                for (int c = 0; c < (numChannels - 4); c++)
-                {
-                    float score = output[0, 0, 4 + c, i];
-                    if (score > maxClassScore)
-                    {
-                        maxClassScore = score;
-                        classId = c;
-                    }
-                }
-
-                // Convert raw logit to a 0.0-1.0 probability
-                float confidence = Sigmoid(maxClassScore);
-
-                if (confidence > confidenceThreshold)
-                {
-                    // Map center-coordinates to Top-Left Rect format
-                    float x = x_center - (w / 2f);
-                    float y = y_center - (h / 2f);
-
-                    candidates.Add(new Detection
-                    {
-                        classIndex = classId,
-                        className = labels[classId],
-                        confidence = confidence,
-                        bbox = new Rect(x, y, w, h)
-                    });
-                }
-            }
-
-            // 4. Remove overlapping boxes
-            results = ApplyNMS(candidates, nmsThreshold);
+            return results;
         }
-
-        return results;
     }
 
-    public bool IsReady() => worker != null;
+    private List<Detection> ParseOutput(Tensor output)
+    {
+        List<Detection> candidates = new List<Detection>();
+
+        // YOLOv8 output is usually interpreted by Barracuda as:
+        // batch: 0, height: 0, width: channel_index, channels: box_index
+        // Or sometimes: [0, 0, box_index, channel_index]
+
+        for (int i = 0; i < numBoxes; i++)
+        {
+            // Try the [batch, height, width, channel] format
+            // In your case, this usually maps to [0, 0, 4, i] for confidence
+            float confidence = output[0, 0, i, 4];
+
+            if (confidence > confidenceThreshold)
+            {
+                float x = output[0, 0, i, 0];
+                float y = output[0, 0, i, 1];
+                float w = output[0, 0, i, 2];
+                float h = output[0, 0, i, 3];
+                int classIdx = Mathf.RoundToInt(output[0, 0, i, 5]);
+
+                candidates.Add(new Detection
+                {
+                    classIndex = classIdx,
+                    className = "Object",
+                    confidence = confidence,
+                    bbox = new Rect(x - w / 2, y - h / 2, w, h)
+                });
+            }
+        }
+
+        return ApplyNMS(candidates, nmsThreshold);
+    }
+
+    public bool IsReady() => worker != null && resizedRT != null;
 
     private List<Detection> ApplyNMS(List<Detection> boxes, float threshold)
     {
         var sorted = boxes.OrderByDescending(b => b.confidence).ToList();
         List<Detection> selected = new List<Detection>();
+
         while (sorted.Count > 0)
         {
             var current = sorted[0];
             selected.Add(current);
             sorted.RemoveAt(0);
+
             for (int i = sorted.Count - 1; i >= 0; i--)
             {
-                if (IntersectionOverUnion(current.bbox, sorted[i].bbox) > threshold) sorted.RemoveAt(i);
+                if (IntersectionOverUnion(current.bbox, sorted[i].bbox) > threshold)
+                    sorted.RemoveAt(i);
             }
         }
         return selected;
@@ -138,13 +133,15 @@ public class Yolov8Detector : MonoBehaviour
             Mathf.Min(a.xMax, b.xMax),
             Mathf.Min(a.yMax, b.yMax)
         );
+
         if (intersect.width <= 0 || intersect.height <= 0) return 0;
-        float intersectArea = intersect.width * intersect.height;
-        return intersectArea / (areaA + areaB - intersectArea);
+        float intersectionArea = intersect.width * intersect.height;
+        return intersectionArea / (areaA + areaB - intersectionArea);
     }
 
-    private void OnDisable()
+    private void OnDestroy()
     {
+        // Clean up GPU resources
         worker?.Dispose();
         if (resizedRT != null) resizedRT.Release();
     }
