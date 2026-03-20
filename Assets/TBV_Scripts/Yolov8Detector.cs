@@ -1,178 +1,148 @@
 using UnityEngine;
 using Unity.Barracuda;
 using System.Collections.Generic;
+using System.Linq;
 
-// Note: Ensure your Detection.cs file defines Detection as a 'struct' to reduce memory pressure
-public class YOLOv8Detector : MonoBehaviour
+public class Yolov8Detector : MonoBehaviour
 {
-    [Header("Model Settings")]
+    [Header("Resources")]
     public NNModel modelAsset;
 
-    [Header("Detection Settings")]
-    [Range(0f, 1f)] public float confidenceThreshold = 0.25f;
-    [Range(0f, 1f)] public float iouThreshold = 0.45f;
+    [Header("Settings")]
+    public int modelInputSize = 640;
+    [Range(0, 1)] public float confidenceThreshold = 0.5f;
+    [Range(0, 1)] public float nmsThreshold = 0.45f;
 
-    [Header("Input Settings")]
-    public int inputWidth = 640;
-    public int inputHeight = 640;
+    [Header("Debug")]
+    public bool showDebugLogs = true;
 
-    private Model runtimeModel;
-    private IWorker engine;
-    private bool isInitialized = false;
+    private IWorker worker;
+    private RenderTexture resizedRT;
 
-    // Updated for your specific model classes
-    private string[] classNames = new string[] { "Rock", "Root" };
+    // Standard YOLOv8-base constants
+    private const int numBoxes = 8400;
+    private const int numChannels = 6;
 
     void Start()
     {
-        Invoke(nameof(InitializeModel), 2f);
-    }
-
-    void InitializeModel()
-    {
         if (modelAsset == null)
         {
-            Debug.LogError("No model asset assigned!");
+            Debug.LogError("[YOLO] ERROR: Model Asset is MISSING!");
             return;
         }
 
-        try
+        // 1. Load the model
+        Model runtimeModel = ModelLoader.Load(modelAsset);
+
+        // 2. Create the worker (GPU-accelerated)
+        worker = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, runtimeModel);
+
+        // 3. Initialize the inference buffer immediately.
+        // Doing this here prevents the "Off-axis" crash caused by uninitialized textures.
+        resizedRT = new RenderTexture(modelInputSize, modelInputSize, 0, RenderTextureFormat.ARGB32);
+        resizedRT.Create();
+
+        if (showDebugLogs)
+            Debug.Log($"[YOLO] Worker initialized. Buffer set to {modelInputSize}x{modelInputSize}.");
+    }
+
+    public List<Detection> Detect(Texture2D frame)
+    {
+        if (worker == null || frame == null) return new List<Detection>();
+
+        // 4. Use the GPU to force the input frame into the perfect 640x640 shape
+        Graphics.Blit(frame, resizedRT);
+
+        // 5. Convert to Tensor for Barracuda
+        using (var inputTensor = new Tensor(resizedRT, 3))
         {
-            runtimeModel = ModelLoader.Load(modelAsset);
-            engine = WorkerFactory.CreateWorker(WorkerFactory.Type.ComputePrecompiled, runtimeModel);
-            isInitialized = true;
-            Debug.Log("YOLOv8 custom model (Rock/Root) initialized successfully!");
+            worker.Execute(inputTensor);
+
+            // Get output and process
+            var output = worker.PeekOutput();
+            var results = ParseOutput(output);
+
+            return results;
         }
-        catch (System.Exception e)
+    }
+
+    private List<Detection> ParseOutput(Tensor output)
+    {
+        List<Detection> candidates = new List<Detection>();
+
+        // YOLOv8 output is usually interpreted by Barracuda as:
+        // batch: 0, height: 0, width: channel_index, channels: box_index
+        // Or sometimes: [0, 0, box_index, channel_index]
+
+        for (int i = 0; i < numBoxes; i++)
         {
-            Debug.LogError($"Failed to initialize model: {e.Message}");
-        }
-    }
+            // Try the [batch, height, width, channel] format
+            // In your case, this usually maps to [0, 0, 4, i] for confidence
+            float confidence = output[0, 0, i, 4];
 
-    public List<Detection> Detect(Texture2D inputImage)
-    {
-        if (!isInitialized) return new List<Detection>();
-
-        Tensor inputTensor = Preprocess(inputImage);
-        engine.Execute(inputTensor);
-        Tensor output = engine.PeekOutput();
-        List<Detection> detections = PostProcess(output, inputImage.width, inputImage.height);
-        inputTensor.Dispose();
-
-        return detections;
-    }
-
-    Tensor Preprocess(Texture2D source)
-    {
-        RenderTexture rt = RenderTexture.GetTemporary(inputWidth, inputHeight, 0, RenderTextureFormat.ARGB32);
-        Graphics.Blit(source, rt);
-        Tensor tensor = new Tensor(rt, 3);
-        RenderTexture.ReleaseTemporary(rt);
-        return tensor;
-    }
-
-    List<Detection> PostProcess(Tensor output, int originalWidth, int originalHeight)
-    {
-        List<Detection> allDetections = new List<Detection>();
-        float[] outputData = output.ToReadOnlyArray();
-
-        int numPredictions = 8400;
-        int numClasses = classNames.Length; // Adjusted to 2 classes
-
-        for (int i = 0; i < numPredictions; i++)
-        {
-            float maxConfidence = 0f;
-            int maxClassIndex = 0;
-
-            for (int c = 0; c < numClasses; c++)
+            if (confidence > confidenceThreshold)
             {
-                // Indexing logic for YOLOv8: 4 box coords + N classes
-                int index = (4 + c) * numPredictions + i;
-                float confidence = outputData[index];
+                float x = output[0, 0, i, 0];
+                float y = output[0, 0, i, 1];
+                float w = output[0, 0, i, 2];
+                float h = output[0, 0, i, 3];
+                int classIdx = Mathf.RoundToInt(output[0, 0, i, 5]);
 
-                if (confidence > maxConfidence)
+                candidates.Add(new Detection
                 {
-                    maxConfidence = confidence;
-                    maxClassIndex = c;
-                }
-            }
-
-            if (maxConfidence < confidenceThreshold) continue;
-
-            float cx = outputData[0 * numPredictions + i];
-            float cy = outputData[1 * numPredictions + i];
-            float w = outputData[2 * numPredictions + i];
-            float h = outputData[3 * numPredictions + i];
-
-            float x1 = (cx - w / 2f) * originalWidth;
-            float y1 = (cy - h / 2f) * originalHeight;
-            float boxWidth = w * originalWidth;
-            float boxHeight = h * originalHeight;
-
-            allDetections.Add(new Detection
-            {
-                classIndex = maxClassIndex,
-                className = classNames[maxClassIndex],
-                confidence = maxConfidence,
-                bbox = new Rect(x1, y1, boxWidth, boxHeight)
-            });
-        }
-
-        return ApplyNMS(allDetections, iouThreshold);
-    }
-
-    List<Detection> ApplyNMS(List<Detection> detections, float iouThreshold)
-    {
-        detections.Sort((a, b) => b.confidence.CompareTo(a.confidence));
-        List<Detection> result = new List<Detection>();
-        bool[] suppressed = new bool[detections.Count];
-
-        for (int i = 0; i < detections.Count; i++)
-        {
-            if (suppressed[i]) continue;
-            result.Add(detections[i]);
-
-            for (int j = i + 1; j < detections.Count; j++)
-            {
-                if (suppressed[j]) continue;
-                if (CalculateIOU(detections[i].bbox, detections[j].bbox) > iouThreshold)
-                {
-                    suppressed[j] = true;
-                }
+                    classIndex = classIdx,
+                    className = "Object",
+                    confidence = confidence,
+                    bbox = new Rect(x - w / 2, y - h / 2, w, h)
+                });
             }
         }
 
-        return result;
+        return ApplyNMS(candidates, nmsThreshold);
     }
 
-    float CalculateIOU(Rect box1, Rect box2)
+    public bool IsReady() => worker != null && resizedRT != null;
+
+    private List<Detection> ApplyNMS(List<Detection> boxes, float threshold)
     {
-        float x1 = Mathf.Max(box1.xMin, box2.xMin);
-        float y1 = Mathf.Max(box1.yMin, box2.yMin);
-        float x2 = Mathf.Min(box1.xMax, box2.xMax);
-        float y2 = Mathf.Min(box1.yMax, box2.yMax);
+        var sorted = boxes.OrderByDescending(b => b.confidence).ToList();
+        List<Detection> selected = new List<Detection>();
 
-        float intersectionArea = Mathf.Max(0, x2 - x1) * Mathf.Max(0, y2 - y1);
-        float unionArea = box1.width * box1.height + box2.width * box2.height - intersectionArea;
-
-        return unionArea == 0 ? 0 : intersectionArea / unionArea;
-    }
-
-    public bool IsReady()
-    {
-        return isInitialized;
-    }
-
-    void OnDestroy()
-    {
-        // Fix for "Low Memory on Close": Explicitly release resources
-        if (engine != null)
+        while (sorted.Count > 0)
         {
-            engine.Dispose();
-            engine = null;
-        }
+            var current = sorted[0];
+            selected.Add(current);
+            sorted.RemoveAt(0);
 
-        Resources.UnloadUnusedAssets();
-        System.GC.Collect();
+            for (int i = sorted.Count - 1; i >= 0; i--)
+            {
+                if (IntersectionOverUnion(current.bbox, sorted[i].bbox) > threshold)
+                    sorted.RemoveAt(i);
+            }
+        }
+        return selected;
+    }
+
+    private float IntersectionOverUnion(Rect a, Rect b)
+    {
+        float areaA = a.width * a.height;
+        float areaB = b.width * b.height;
+        Rect intersect = Rect.MinMaxRect(
+            Mathf.Max(a.xMin, b.xMin),
+            Mathf.Max(a.yMin, b.yMin),
+            Mathf.Min(a.xMax, b.xMax),
+            Mathf.Min(a.yMax, b.yMax)
+        );
+
+        if (intersect.width <= 0 || intersect.height <= 0) return 0;
+        float intersectionArea = intersect.width * intersect.height;
+        return intersectionArea / (areaA + areaB - intersectionArea);
+    }
+
+    private void OnDestroy()
+    {
+        // Clean up GPU resources
+        worker?.Dispose();
+        if (resizedRT != null) resizedRT.Release();
     }
 }

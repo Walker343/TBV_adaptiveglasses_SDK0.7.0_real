@@ -1,37 +1,32 @@
 using UnityEngine;
 using Viture.XR;
+using UnityEngine.Rendering;
+using System.Threading.Tasks;
 #if UNITY_ANDROID
-using UnityEngine.Android; // This is the line that was missing or being ignored
+using UnityEngine.Android;
 #endif
 
 public class VitureRGBCamera : MonoBehaviour
 {
     [Header("Camera Settings")]
-    public int desiredWidth = 1920;
-    public int desiredHeight = 1080;
+    public int desiredWidth = 640;
+    public int desiredHeight = 640;
 
     [Header("Debug")]
     public bool showDebugLogs = true;
 
     private RenderTexture cameraRenderTexture;
-    private Texture2D currentFrame;
+    private RenderTexture lowResRT;
     private bool isReady = false;
-
-    // We'll use this to prevent spamming the console if it's not ready yet
-    private float nextDebugLogTime = 0f;
 
     void Start()
     {
-        // This 'if' block tells Unity: "Only look at this code if we are building for Android"
 #if UNITY_ANDROID
         if (!Permission.HasUserAuthorizedPermission(Permission.Camera))
         {
-            Debug.Log("[VitureCamera] Requesting Camera Permission from OS...");
             Permission.RequestUserPermission(Permission.Camera);
         }
 #endif
-
-        // Wait 2 seconds to give the user time to see the Android popup
         Invoke(nameof(InitializeCamera), 2f);
     }
 
@@ -43,89 +38,51 @@ public class VitureRGBCamera : MonoBehaviour
             return;
         }
 
-        if (VitureRGBCameraManager.Instance == null)
+        var manager = VitureRGBCameraManager.Instance;
+        if (manager != null)
         {
-            Debug.LogError("VitureRGBCameraManager not found in scene! Make sure it exists.");
-            return;
-        }
+            cameraRenderTexture = manager.CameraRenderTexture;
 
-        if (showDebugLogs)
-        {
-            Debug.Log("RGB camera is supported! Forcing Start...");
-        }
+            // Create the low-res GPU buffer (640x640)
+            lowResRT = new RenderTexture(desiredWidth, desiredHeight, 0);
+            lowResRT.Create();
 
-        // Your exact logic to force the camera to start
-        VitureXR.Camera.RGB.Start();
-
-        isReady = true;
-        Debug.Log("[VitureCamera] Automated Startup Complete. Camera Start() command sent.");
-    }
-
-    void Update()
-    {
-        if (!isReady) return;
-
-        VitureRGBCameraManager manager = VitureRGBCameraManager.Instance;
-        if (manager != null && manager.CameraRenderTexture != null)
-        {
-            RenderTexture rt = manager.CameraRenderTexture;
-
-            if (currentFrame == null || rt != cameraRenderTexture)
-            {
-                cameraRenderTexture = rt;
-
-                // Recreate Texture2D if resolution changed or it doesn't exist yet
-                if (currentFrame == null || currentFrame.width != rt.width || currentFrame.height != rt.height)
-                {
-                    if (currentFrame != null)
-                        Destroy(currentFrame);
-
-                    currentFrame = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false);
-                    Debug.Log($"Created Texture2D for YOLO: {rt.width}x{rt.height}");
-                }
-            }
-
-            // Copy RenderTexture to Texture2D for YOLO
-            if (cameraRenderTexture != null && currentFrame != null)
-            {
-                RenderTexture.active = cameraRenderTexture;
-                currentFrame.ReadPixels(new Rect(0, 0, cameraRenderTexture.width, cameraRenderTexture.height), 0, 0);
-                currentFrame.Apply();
-                RenderTexture.active = null;
-            }
+            isReady = true;
+            if (showDebugLogs) Debug.Log($"[VitureCamera] AI Buffer Initialized: {desiredWidth}x{desiredHeight}");
         }
     }
 
-    public Texture2D GetCurrentFrame()
+    /// <summary>
+    /// Forces a low-resolution capture (640x640) asynchronously.
+    /// This prevents the 1080p shape-mismatch crash.
+    /// </summary>
+    public async Task<Texture2D> CaptureLowResFrameAsync()
     {
-        return currentFrame;
+        if (!isReady || cameraRenderTexture == null) return null;
+
+        // 1. Resize from 1080p to 640x640 on the GPU
+        Graphics.Blit(cameraRenderTexture, lowResRT);
+
+        // 2. Request the data from the GPU asynchronously
+        var request = AsyncGPUReadback.Request(lowResRT);
+
+        while (!request.done)
+        {
+            await Task.Yield();
+        }
+
+        if (request.hasError) return null;
+
+        // 3. Create a small texture and fill it with the 640x640 data
+        Texture2D tex = new Texture2D(desiredWidth, desiredHeight, TextureFormat.RGBA32, false);
+        tex.SetPixelData(request.GetData<Color32>(), 0);
+        tex.Apply();
+
+        return tex;
     }
 
     public bool IsReady()
     {
-        bool isActive = VitureXR.Camera.RGB.isActive;
-        bool hasFrame = currentFrame != null;
-        bool hasManager = VitureRGBCameraManager.Instance != null;
-        bool hasRT = hasManager && VitureRGBCameraManager.Instance.CameraRenderTexture != null;
-
-        bool readyStatus = isReady && isActive && hasFrame && hasManager && hasRT;
-
-        // If it's NOT ready, print a log every 2 seconds explaining exactly WHY
-        if (!readyStatus && showDebugLogs && Time.time > nextDebugLogTime && isReady)
-        {
-            Debug.LogWarning($"[Camera Waiting] isActive:{isActive}, hasFrame:{hasFrame}, hasManager:{hasManager}, hasRT:{hasRT}");
-            nextDebugLogTime = Time.time + 2f;
-        }
-
-        return readyStatus;
-    }
-
-    void OnDestroy()
-    {
-        // Make sure we shut the camera down properly
-        if (VitureXR.Camera.RGB.isSupported)
-        {
-            VitureXR.Camera.RGB.Stop();
-        }
+        return isReady && VitureXR.Camera.RGB.isActive && cameraRenderTexture != null;
     }
 }

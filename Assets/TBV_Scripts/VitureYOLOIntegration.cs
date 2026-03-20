@@ -6,7 +6,7 @@ public class VitureYOLOIntegration : MonoBehaviour
 {
     [Header("Components")]
     public VitureRGBCamera vitureCamera;
-    public YOLOv8Detector yoloDetector;
+    public Yolov8Detector yoloDetector;
 
     [Header("UI")]
     public TextMeshProUGUI statsText;
@@ -19,48 +19,58 @@ public class VitureYOLOIntegration : MonoBehaviour
 
     private float lastDetectionTime;
     private List<Detection> currentDetections = new List<Detection>();
+    private bool isDetecting = false;
 
     // FPS tracking
     private float fpsTimer;
     private int frameCount;
     private float currentFPS;
 
-    void Start()
-    {
-        Debug.Log("=== VitureYOLOIntegration START ===");
-
-        if (vitureCamera == null)
-        {
-            Debug.LogError("VitureRGBCamera component not assigned!");
-        }
-        else
-        {
-            Debug.Log("VitureRGBCamera assigned OK");
-        }
-
-        if (yoloDetector == null)
-        {
-            Debug.LogError("YOLOv8Detector component not assigned!");
-        }
-        else
-        {
-            Debug.Log("YOLOv8Detector assigned OK");
-        }
-    }
-
     void Update()
     {
         UpdateFPS();
 
-        if (vitureCamera == null || yoloDetector == null) return;
+        // CHECK 1: Wait for Camera initialization (prevents the 2-second startup crash)
+        if (vitureCamera == null || !vitureCamera.IsReady()) return;
 
-        // FIX: Added parentheses to call the methods instead of referencing the method group
-        if (!vitureCamera.IsReady() || !yoloDetector.IsReady()) return;
+        // CHECK 2: Ensure AI is ready
+        if (yoloDetector == null || !yoloDetector.IsReady()) return;
 
-        if (Time.time - lastDetectionTime >= detectionInterval)
+        if (!isDetecting && Time.time - lastDetectionTime >= detectionInterval)
         {
             RunDetection();
             lastDetectionTime = Time.time;
+        }
+    }
+
+    async void RunDetection()
+    {
+        isDetecting = true;
+
+        // Use the new Low-Res capture to guarantee 640x640 input
+        Texture2D frame = await vitureCamera.CaptureLowResFrameAsync();
+
+        if (frame == null)
+        {
+            isDetecting = false;
+            return;
+        }
+
+        if (showDebugLogs && currentFPS > 0)
+            Debug.Log($"[YOLO] Scanning 640x640 frame... ({currentFPS:F1} FPS)");
+
+        // Run the AI on the perfectly-sized frame
+        currentDetections = yoloDetector.Detect(frame);
+
+        // Clean up the temporary frame immediately to prevent memory leaks
+        Destroy(frame);
+
+        UpdateStatsDisplay();
+        isDetecting = false;
+
+        if (showDebugLogs && currentDetections.Count > 0)
+        {
+            Debug.Log($"[YOLO] SUCCESS! Detected {currentDetections.Count} objects.");
         }
     }
 
@@ -68,13 +78,11 @@ public class VitureYOLOIntegration : MonoBehaviour
     {
         frameCount++;
         fpsTimer += Time.deltaTime;
-
         if (fpsTimer >= 1.0f)
         {
             currentFPS = frameCount / fpsTimer;
             frameCount = 0;
             fpsTimer = 0;
-
             UpdateStatsDisplay();
         }
     }
@@ -82,36 +90,6 @@ public class VitureYOLOIntegration : MonoBehaviour
     void UpdateStatsDisplay()
     {
         if (statsText != null)
-        {
             statsText.text = $"FPS: {currentFPS:F1}\nDetections: {currentDetections.Count}";
-        }
-    }
-
-    void RunDetection()
-    {
-        Texture2D frame = vitureCamera.GetCurrentFrame();
-        if (frame == null)
-        {
-            Debug.LogWarning("No frame from VitureRGBCamera!");
-            return;
-        }
-
-        currentDetections = yoloDetector.Detect(frame);
-
-        UpdateStatsDisplay();
-
-        if (showDebugLogs && currentDetections.Count > 0)
-        {
-            Debug.Log($"Detected {currentDetections.Count} objects:");
-            foreach (var det in currentDetections)
-            {
-                Debug.Log($"  - {det.className} at ({det.bbox.x:F0}, {det.bbox.y:F0}) confidence: {det.confidence:F2}");
-            }
-        }
-    }
-
-    public List<Detection> GetCurrentDetections()
-    {
-        return new List<Detection>(currentDetections);
     }
 }

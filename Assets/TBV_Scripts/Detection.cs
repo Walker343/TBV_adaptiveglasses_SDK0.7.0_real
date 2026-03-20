@@ -7,9 +7,4 @@ public struct Detection
     public string className;
     public float confidence;
     public Rect bbox;
-
-    public override string ToString()
-    {
-        return $"{className} ({confidence:F2}) at {bbox}";
-    }
 }
