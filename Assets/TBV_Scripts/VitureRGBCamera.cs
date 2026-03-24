@@ -1,4 +1,4 @@
-using UnityEngine;
+﻿using UnityEngine;
 using Viture.XR;
 using UnityEngine.Rendering;
 using System.Threading.Tasks;
@@ -12,20 +12,25 @@ public class VitureRGBCamera : MonoBehaviour
     public int desiredWidth = 640;
     public int desiredHeight = 640;
 
+    [Header("Gamma Correction")]
+    [Range(0.1f, 4.0f)]
+    public float gammaCorrection = 0.6f; // <1 darkens bright scenes, >1 brightens dark scenes
+
     [Header("Debug")]
     public bool showDebugLogs = true;
 
-    private RenderTexture cameraRenderTexture;
     private RenderTexture lowResRT;
+    private Texture2D latestFrame;
+    private Material oesMaterial;
     private bool isReady = false;
+
+    private const string k_OESBlitShader = "Hidden/VitureXR/OESBlit";
 
     void Start()
     {
 #if UNITY_ANDROID
         if (!Permission.HasUserAuthorizedPermission(Permission.Camera))
-        {
             Permission.RequestUserPermission(Permission.Camera);
-        }
 #endif
         Invoke(nameof(InitializeCamera), 2f);
     }
@@ -34,55 +39,90 @@ public class VitureRGBCamera : MonoBehaviour
     {
         if (!VitureXR.Camera.RGB.isSupported)
         {
-            Debug.LogError("RGB camera is not supported on this device!");
+            Debug.LogError("[VitureRGBCamera] RGB camera not supported!");
             return;
         }
 
-        var manager = VitureRGBCameraManager.Instance;
-        if (manager != null)
+        var resolutions = VitureXR.Camera.RGB.GetSupportedResolutions();
+        foreach (var res in resolutions)
+            Debug.Log($"[Camera] Supported resolution: {res.x}x{res.y}");
+
+        VitureXR.Camera.RGB.Start();
+
+        Shader shader = Shader.Find(k_OESBlitShader);
+        if (shader != null)
         {
-            cameraRenderTexture = manager.CameraRenderTexture;
-
-            // Create the low-res GPU buffer (640x640)
-            lowResRT = new RenderTexture(desiredWidth, desiredHeight, 0);
-            lowResRT.Create();
-
-            isReady = true;
-            if (showDebugLogs) Debug.Log($"[VitureCamera] AI Buffer Initialized: {desiredWidth}x{desiredHeight}");
+            oesMaterial = new Material(shader);
+            if (showDebugLogs) Debug.Log("[VitureRGBCamera] OES Shader loaded.");
         }
-    }
-
-    /// <summary>
-    /// Forces a low-resolution capture (640x640) asynchronously.
-    /// This prevents the 1080p shape-mismatch crash.
-    /// </summary>
-    public async Task<Texture2D> CaptureLowResFrameAsync()
-    {
-        if (!isReady || cameraRenderTexture == null) return null;
-
-        // 1. Resize from 1080p to 640x640 on the GPU
-        Graphics.Blit(cameraRenderTexture, lowResRT);
-
-        // 2. Request the data from the GPU asynchronously
-        var request = AsyncGPUReadback.Request(lowResRT);
-
-        while (!request.done)
+        else
         {
-            await Task.Yield();
+            Debug.LogWarning("[VitureRGBCamera] OES Shader not found, falling back.");
         }
 
-        if (request.hasError) return null;
+        lowResRT = new RenderTexture(desiredWidth, desiredHeight, 0, RenderTextureFormat.ARGB32);
+        lowResRT.Create();
 
-        // 3. Create a small texture and fill it with the 640x640 data
-        Texture2D tex = new Texture2D(desiredWidth, desiredHeight, TextureFormat.RGBA32, false);
-        tex.SetPixelData(request.GetData<Color32>(), 0);
-        tex.Apply();
+        latestFrame = new Texture2D(desiredWidth, desiredHeight, TextureFormat.RGBA32, false);
 
-        return tex;
+        isReady = true;
+        if (showDebugLogs) Debug.Log($"[VitureRGBCamera] Ready: {desiredWidth}x{desiredHeight}");
     }
 
     public bool IsReady()
     {
-        return isReady && VitureXR.Camera.RGB.isActive && cameraRenderTexture != null;
+        var manager = Viture.XR.VitureRGBCameraManager.Instance;
+        bool managerOk = manager != null;
+        bool textureOk = managerOk && manager.CameraRenderTexture != null;
+        bool activeOk = VitureXR.Camera.RGB.isActive;
+        if (showDebugLogs)
+            Debug.Log($"[VitureRGBCamera] IsReady check — ready:{isReady} manager:{managerOk} texture:{textureOk} active:{activeOk}");
+        return isReady && textureOk && activeOk;
+    }
+
+    public async Task<Texture2D> CaptureLowResFrameAsync()
+    {
+        var manager = Viture.XR.VitureRGBCameraManager.Instance;
+        if (!isReady || manager == null || manager.CameraRenderTexture == null) return null;
+
+        RenderTexture liveRT = manager.CameraRenderTexture;
+
+        if (oesMaterial != null)
+            Graphics.Blit(liveRT, lowResRT, oesMaterial);
+        else
+            Graphics.Blit(liveRT, lowResRT);
+
+        var request = AsyncGPUReadback.Request(lowResRT);
+        while (!request.done) await Task.Yield();
+
+        if (request.hasError)
+        {
+            if (showDebugLogs) Debug.LogError("[VitureRGBCamera] GPU Readback Error.");
+            return null;
+        }
+
+        latestFrame.SetPixelData(request.GetData<byte>(), 0);
+        latestFrame.Apply();
+
+        // Gamma correction - tune gammaCorrection in Inspector
+        // 0.4 = darken bright outdoor, 0.6 = indoor daylight, 2.5 = dark indoor
+        Color32[] pixels = latestFrame.GetPixels32();
+        for (int i = 0; i < pixels.Length; i++)
+        {
+            pixels[i].r = (byte)(Mathf.Pow(pixels[i].r / 255f, gammaCorrection) * 255f);
+            pixels[i].g = (byte)(Mathf.Pow(pixels[i].g / 255f, gammaCorrection) * 255f);
+            pixels[i].b = (byte)(Mathf.Pow(pixels[i].b / 255f, gammaCorrection) * 255f);
+        }
+        latestFrame.SetPixels32(pixels);
+        latestFrame.Apply();
+
+        return latestFrame;
+    }
+
+    private void OnDestroy()
+    {
+        if (lowResRT != null) lowResRT.Release();
+        if (latestFrame != null) Destroy(latestFrame);
+        if (oesMaterial != null) Destroy(oesMaterial);
     }
 }
